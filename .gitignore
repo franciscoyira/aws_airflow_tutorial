@@ -135,3 +135,6 @@ logs/
 unittests.cfg
 dags/__pycache__/
 dags/*.pyc
+
+# Virtual env
+/venv_airflow
