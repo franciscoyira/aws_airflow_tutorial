@@ -1,16 +1,17 @@
-# standard library imports
 from datetime import datetime, timedelta, timezone
-
-# related third party imports
-import boto3
-from pandas import read_csv, concat, pivot_table, to_datetime
-from s3fs import S3FileSystem
 import time
+from pandas import read_csv, concat, pivot_table, to_datetime
+
+import boto3
+from s3fs import S3FileSystem
 
 # Create a boto3 session to interact with S3/AWS
 session = boto3.Session()
 s3 = session.client('s3', region_name='us-east-1')
 rds = boto3.client('rds', region_name='us-east-1')
+
+import os
+bucket_name = os.getenv('BUCKET_NAME')
 
 # local application/library specific imports
 from airflow import DAG
@@ -23,8 +24,6 @@ default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
     'start_date': datetime(2024, 2, 1),
-    'email_on_failure': 'francisco.yira@outlook.com',
-    'email_on_retry': 'francisco.yira@outlook.com',
     'retries': 1,
     'retry_delay': timedelta(minutes=1),
     'catchup': False
@@ -42,7 +41,7 @@ def read_combines_new_files_from_s3(**kwargs):
     
     # Get the list of objects in the source bucket
     objects = s3.list_objects_v2(
-        Bucket='tutorial-airflow-pomodoro-sessions',
+        Bucket=bucket_name,
         Prefix='inputs/')['Contents']
 
     # this returns a dict (within a list) with the names and properties of
@@ -66,12 +65,11 @@ def read_combines_new_files_from_s3(**kwargs):
     for obj in objects:
         print('Last modified object: ', obj['LastModified'])
         if obj['LastModified'] > last_dag_run_date:
-            dfs.append(read_csv('s3://tutorial-airflow-pomodoro-sessions/' + obj['Key']))
+            dfs.append(read_csv(f's3://{bucket_name}/' + obj['Key']))
     
     if len(dfs) > 0:
         df_combined = concat(dfs, axis=0)
-        # Write df_combined to s3://tutorial-airflow-pomodoro-sessions/intermediate_data/df_combined.csv
-        df_combined.to_csv('s3://tutorial-airflow-pomodoro-sessions/intermediate_data/df_combined.csv', index=False)
+        df_combined.to_csv(f's3://{bucket_name}/intermediate_data/df_combined.csv', index=False)
         return True
     else:
         return False
@@ -88,7 +86,7 @@ def branch_function(**kwargs):
 
 
 def pivoting_df(**kwargs):
-    s3_file_path = 's3://tutorial-airflow-pomodoro-sessions/intermediate_data/df_combined.csv'
+    s3_file_path = f's3://{bucket_name}/intermediate_data/df_combined.csv'
     df = read_csv(s3_file_path)
 
     df = df.drop('End date', axis=1)
@@ -120,17 +118,16 @@ def pivoting_df(**kwargs):
     df_pivoted.columns.name = None
 
     # Remove df_combined.csv from S3
-    bucket_name = 'tutorial-airflow-pomodoro-sessions'
     file_key = 'intermediate_data/df_combined.csv'
     s3.delete_object(Bucket=bucket_name, Key=file_key)
 
-    df_pivoted.to_csv('s3://tutorial-airflow-pomodoro-sessions/intermediate_data/df_pivoted.csv', index=False)
+    df_pivoted.to_csv(f's3://{bucket_name}/intermediate_data/df_pivoted.csv', index=False)
 
 # Define the function that performs the upsert
 def upsert_df_to_rds(**kwargs):
     db_instance_identifier = 'airflow-postgres'
 
-    s3_file_path = 's3://tutorial-airflow-pomodoro-sessions/intermediate_data/df_pivoted.csv'
+    s3_file_path = f's3://{bucket_name}/intermediate_data/df_pivoted.csv'
     
     # Read the DataFrame directly from the S3 CSV file
     # specifying data types so they match the destination table
@@ -208,7 +205,6 @@ def upsert_df_to_rds(**kwargs):
     rds_hook.run(f"DROP TABLE tmp_{table};")
 
     # Remove df_pivoted.csv from S3
-    bucket_name = 'tutorial-airflow-pomodoro-sessions'
     file_key = 'intermediate_data/df_pivoted.csv'
     s3.delete_object(Bucket=bucket_name, Key=file_key)
 
