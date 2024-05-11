@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
-import time
 from pandas import read_csv, concat, pivot_table, to_datetime
+import time
 
 import boto3
 from s3fs import S3FileSystem
@@ -10,8 +10,8 @@ session = boto3.Session()
 s3 = session.client('s3', region_name='us-east-1')
 rds = boto3.client('rds', region_name='us-east-1')
 
-import os
-bucket_name = os.getenv('BUCKET_NAME')
+from airflow.models import Variable
+bucket_name = Variable.get("BUCKET_NAME")
 
 # local application/library specific imports
 from airflow import DAG
@@ -23,32 +23,33 @@ from airflow.hooks.postgres_hook import PostgresHook
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 2, 1),
+    'start_date': datetime(2024, 3, 1),
+    'catchup': False,
     'retries': 1,
-    'retry_delay': timedelta(minutes=1),
-    'catchup': False
+    'retry_delay': timedelta(minutes=1) 
 }
 
 # Instantiate the DAG
 dag = DAG(
     dag_id='transform_and_upsert',
     default_args=default_args,
-    # this means the DAG will run every day at the same time as start date
     schedule="@monthly"
 )
 
-def read_combines_new_files_from_s3(**kwargs):
-    
-    # Get the list of objects in the source bucket
-    objects = s3.list_objects_v2(
-        Bucket=bucket_name,
-        Prefix='inputs/')['Contents']
+s3.list_objects_v2(Bucket=bucket_name, Prefix='inputs/')
 
-    # this returns a dict (within a list) with the names and properties of
-    # the objects in our bucket
+def read_combines_new_files_from_s3(**kwargs):
+    bucket_name = kwargs['params']['my_bucket_name']
+    print(f'Bucket name is: {bucket_name}')
+
+    response = s3.list_objects_v2(
+        Bucket=bucket_name,
+        Prefix='input_data/')
+    objects = response.get('Contents', [])
 
    # Find the last successful run of the current DAG
     dag_runs = DagRun.find(dag_id='transform_and_upsert', state='success')
+    
     if len(dag_runs) > 0:
         # Use the execution date of the last successful run
         last_dag_run_date = dag_runs[-1].execution_date
@@ -58,10 +59,10 @@ def read_combines_new_files_from_s3(**kwargs):
 
     print('Last dag run date: ', last_dag_run_date)
 
-    # For the objects that are more recent than the last dag run date,
-    # reads them (using read_csv) and combines in them in a pandas dataframe
+    # Reading the objects that are more recent than last_dag_run_date into a Pandas DataFrame 
     dfs = []
     df_combined = None
+    
     for obj in objects:
         print('Last modified object: ', obj['LastModified'])
         if obj['LastModified'] > last_dag_run_date:
@@ -83,7 +84,6 @@ def branch_function(**kwargs):
         return 'pivoting_df'
     else:
         return 'end_task'
-
 
 def pivoting_df(**kwargs):
     s3_file_path = f's3://{bucket_name}/intermediate_data/df_combined.csv'
@@ -125,12 +125,10 @@ def pivoting_df(**kwargs):
 
 # Define the function that performs the upsert
 def upsert_df_to_rds(**kwargs):
+    
     db_instance_identifier = 'airflow-postgres'
-
     s3_file_path = f's3://{bucket_name}/intermediate_data/df_pivoted.csv'
     
-    # Read the DataFrame directly from the S3 CSV file
-    # specifying data types so they match the destination table
     dtype_spec = {'work_minutes': 'float', 'learning_minutes': 'float'}
     df = read_csv(s3_file_path, dtype=dtype_spec, parse_dates=['Start date'])
 
@@ -141,7 +139,7 @@ def upsert_df_to_rds(**kwargs):
             ApplyImmediately=True
         )
     
-    # This change is not applied immediatly, so we need to wait for it to be applied
+    # This change takes some time to be applied, so we need to wait a bit
     elapsed_time = 0
     timeout = 300
     interval = 30
@@ -176,10 +174,6 @@ def upsert_df_to_rds(**kwargs):
     # Get the table name and schema from the parameters
     table = kwargs['params']['table']
     schema = kwargs['params']['schema']
-
-    # Ensure the DataFrame has columns in the correct order
-    expected_columns = ['Start date', 'learning_minutes', 'work_minutes']
-    df = df[expected_columns]
     
     # Create a temporary table with the same structure as the target table
     rds_hook.run(f"CREATE TEMPORARY TABLE tmp_{table} (LIKE {schema}.{table});")
@@ -215,7 +209,21 @@ def upsert_df_to_rds(**kwargs):
             ApplyImmediately=True
         )
 
-# Define the task that performs the upsert using PythonOperator
+# Wrapping the Functions into Tasks
+read_task = PythonOperator(
+        task_id='read_combines_new_files_from_s3',
+        python_callable=read_combines_new_files_from_s3,
+        params={
+            'my_bucket_name':bucket_name
+        },
+        dag=dag)
+        
+pivot_task = PythonOperator(
+  task_id='pivoting_df',
+  python_callable=pivoting_df,
+  dag=dag
+)
+        
 upsert_task = PythonOperator(
     task_id='upsert_df_to_rds',
     python_callable=upsert_df_to_rds,
@@ -223,26 +231,12 @@ upsert_task = PythonOperator(
         'table': 'pomodoro_day_catg',
         'schema': 'public'
     },
-    provide_context=True,
-    dag=dag,
+    dag=dag
 )
-
-read_combines_new_files_from_s3 = PythonOperator(
-        task_id='read_combines_new_files_from_s3',
-        python_callable=read_combines_new_files_from_s3,
-        dag=dag)
 
 branch_task = BranchPythonOperator(
   task_id='branch_task',
   python_callable=branch_function,
-  provide_context=True,
-  dag=dag
-)
-
-pivoting_df = PythonOperator(
-  task_id='pivoting_df',
-  python_callable=pivoting_df,
-  provide_context=True,
   dag=dag
 )
 
@@ -252,7 +246,7 @@ end_task = DummyOperator(
   dag=dag
 )
 
-# set the dependencies
-read_combines_new_files_from_s3 >> branch_task
-branch_task >> pivoting_df >> upsert_task
+# Defining the Execution Order
+read_task >> branch_task
+branch_task >> pivot_task >> upsert_task
 branch_task >> end_task
