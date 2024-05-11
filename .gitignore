@@ -138,3 +138,6 @@ dags/*.pyc
 
 # Virtual env
 /airflow_env
+
+# Certificate
+*.pem
